@@ -22,6 +22,9 @@ import logging
 import os
 import random
 import timeit
+import time
+import sys
+import threading
 
 import numpy as np
 import torch
@@ -48,11 +51,14 @@ from transformers.data.metrics.squad_metrics import (
 from transformers.data.processors.squad import SquadResult, SquadV1Processor, SquadV2Processor
 from transformers.trainer_utils import is_main_process
 
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:
-    from tensorboardX import SummaryWriter
+def trace_handler(prof):
+    print(prof.key_averages().table(
+        sort_by="self_cpu_time_total", row_limit=-1))
+    prof.export_chrome_trace("./log/test_trace_" + str(prof.step_num) + ".json")
+#try:
+#    from torch.utils.tensorboard import SummaryWriter
+#except ImportError:
+#    from tensorboardX import SummaryWriter
 
 
 logger = logging.getLogger(__name__)
@@ -266,6 +272,85 @@ def train(args, train_dataset, model, tokenizer):
 
     return global_step, tr_loss / global_step
 
+def wrap_model(model, args):
+    model.eval()
+    dumpy_tensor = torch.ones((args.eval_batch_size, 384), dtype=torch.long) \
+                    if not args.use_multi_stream_module \
+                    else torch.ones((args.eval_batch_size//args.num_streams, 384), dtype=torch.long)
+    jit_inputs = (dumpy_tensor, dumpy_tensor, dumpy_tensor)
+    print(args)
+
+    if args.fp16:
+        #model = ipex.optimize(model, dtype=torch.half, conv_bn_folding=False, auto_kernel_selection=True, weights_prepack=True)
+        #with torch.cpu.amp.autocast(enabled=True, dtype=torch.half):
+        #    model = torch.jit.trace(model, jit_inputs, strict=False)
+        #    model = torch.jit.freeze(model)
+        #tbd
+        print(args)
+    elif args.use_jit:
+        with torch.no_grad():
+            model = torch.jit.trace(model, jit_inputs, strict=False)
+            #model = torch.jit._recursive.wrap_cpp_module(torch._C._freeze_module(model._c, preserveParameters=True)) 
+            model = torch.jit.freeze(model)
+
+    return model 
+
+def benchmark_evaluate(args, model, eval_dataloader):
+    steps_per_epoch = len(eval_dataloader)
+    total_steps = (args.perf_run_iters + args.perf_begin_iter)
+    test_epoches = int(total_steps / steps_per_epoch)
+    print('Evaluating BERT: Steps per Epoch {} total Steps {}'.format(steps_per_epoch, total_steps))
+    total_time = 0
+    i = 0
+    timeBuff = []
+    #with torch.profiler.profile(
+    #        activities=[
+    #            torch.profiler.ProfilerActivity.CPU],
+
+    #        schedule=torch.profiler.schedule(
+    #            wait=1,
+    #            warmup=9,
+    #            active=5),
+    #        #on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/bert_bf16'),#trace_handler
+    #        on_trace_ready=trace_handler#torch.profiler.tensorboard_trace_handler('./log/bert_bf16')
+    #        # used when outputting for tensorboard
+    #        ) as prof:
+
+    with tqdm(total=total_steps, desc="Evaluating") as pbar:
+        for epoch in range(test_epoches + 1):
+            for it, batch in enumerate(eval_dataloader):
+                if epoch * steps_per_epoch + it >= total_steps:
+                    throughput = args.eval_batch_size * args.perf_run_iters / total_time
+                    timeBuff = np.asarray(timeBuff)
+                    p99 = np.percentile(timeBuff, 99)
+                    print('P99 Latency {:.2f} ms'.format(p99*1000))
+                    print("Throughput: {:.3f} sentence/s".format(throughput))     
+                    break
+                with torch.no_grad():
+                    inputs = {
+                        "input_ids": batch[0],
+                        "attention_mask": batch[1],
+                        "token_type_ids": batch[2],
+                    }
+                    #print("---------------**inputs is:{}".format(**inputs))
+                    time_start = time.time()
+                    #print("inputs type is: {}".format(type(inputs)))
+                    #print("inputs is: {}".format(inputs))
+
+                    outputs = model(**inputs)          
+
+                    # print("outputs type is: {}".format(type(outputs)))
+                    # print("outputs len is: {}".format(len(outputs)))
+                    # print("output[0] size is: {}".format(outputs[0].size()))
+                    # print("output[1] size is: {}".format(outputs[1].size()))
+                    # print("outputs is: {}".format(outputs))
+                    #prof.step()
+                    time_end = time.time()
+                    if epoch * steps_per_epoch + it > args.perf_begin_iter:
+                        total_time +=(time_end - time_start)
+                        timeBuff.append(time_end - time_start)
+                    pbar.update(1)
+
 
 def evaluate(args, model, tokenizer, prefix=""):
     dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True)
@@ -275,6 +360,7 @@ def evaluate(args, model, tokenizer, prefix=""):
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
 
+    model = wrap_model(model, args)
     # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(dataset)
     eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
@@ -287,6 +373,20 @@ def evaluate(args, model, tokenizer, prefix=""):
     logger.info("***** Running evaluation {} *****".format(prefix))
     logger.info("  Num examples = %d", len(dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
+
+    if args.benchmark:
+        if args.use_share_weight:
+            threads = []
+            num_instances = args.total_cores // args.cores_per_instance
+            for i in range(0, num_instances):
+               t = threading.Thread(target=benchmark_evaluate, args=(args, model, eval_dataloader))
+               threads.append(t)
+               t.start()
+            for t in threads:
+                t.join()
+        else:
+            benchmark_evaluate(args, model, eval_dataloader)        
+        exit()
 
     all_results = []
     start_time = timeit.default_timer()
@@ -321,7 +421,7 @@ def evaluate(args, model, tokenizer, prefix=""):
             eval_feature = features[feature_index.item()]
             unique_id = int(eval_feature.unique_id)
 
-            output = [to_list(output[i]) for output in outputs.to_tuple()]
+            output = [to_list(output[i]) for output in outputs]
 
             # Some models (XLNet, XLM) use 5 arguments for their predictions, while the other "simpler"
             # models only use two.
@@ -657,8 +757,29 @@ def main():
     )
     parser.add_argument("--server_ip", type=str, default="", help="Can be used for distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="Can be used for distant debugging.")
-
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
+    parser.add_argument("--perf_begin_iter", type=int, default=15,
+                        help="Number iterations to warm up")
+    parser.add_argument("--perf_run_iters", type=int, default=100,
+                        help="Number iterations to collection performance data begin from perf_begin_iter")
+    parser.add_argument("--iter_num", type=int, default=40,
+                        help="Number iterations to collect time")
+    parser.add_argument("--benchmark", action='store_true',
+                        help="Bench the model speed")
+    parser.add_argument("--use_jit", action='store_true', help="For jit trace")
+    parser.add_argument("--use_share_weight", action='store_true',
+                        help="Enable share weight mode")
+    parser.add_argument("--cores_per_instance", type=int, default=4,
+                        help="Number iterations to collect time")
+    parser.add_argument("--total_cores", type=int, default=28,
+                        help="Total cores used for this process, used for share_weight mode")
+    parser.add_argument('--use_multi_stream_module', dest='use_multi_stream_module', action='store_true',
+                        help='Whether use multi stream module for throughput mode')
+    parser.add_argument("--num_streams", type=int, default=1,
+                        help="The number of stream to use, used for multi stream module")
+    parser.add_argument("--instance_number", type=int, default=0,
+                        help="The socket to run multi stream module, used for multi stream module with multi sockets")
+
     args = parser.parse_args()
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
@@ -730,11 +851,13 @@ def main():
     args.model_type = args.model_type.lower()
     config = AutoConfig.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
+        return_dict=False,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
         do_lower_case=args.do_lower_case,
+        return_dict=False,
         cache_dir=args.cache_dir if args.cache_dir else None,
         use_fast=False,  # SquadDataset is not compatible with Fast tokenizers which have a smarter overflow handeling
     )

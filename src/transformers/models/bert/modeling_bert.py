@@ -323,6 +323,8 @@ class BertSelfAttention(nn.Module):
 
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         if attention_mask is not None:
+            if attention_mask.dtype != attention_scores.dtype:
+                attention_mask = attention_mask.to(attention_scores.dtype)
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
             attention_scores = attention_scores + attention_mask
 
@@ -1863,9 +1865,9 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             end_loss = loss_fct(end_logits, end_positions)
             total_loss = (start_loss + end_loss) / 2
 
-        if not return_dict:
-            output = (start_logits, end_logits) + outputs[2:]
-            return ((total_loss,) + output) if total_loss is not None else output
+        #if not return_dict:
+        output = (start_logits, end_logits) + outputs[2:]
+        return ((total_loss,) + output) if total_loss is not None else output
 
         return QuestionAnsweringModelOutput(
             loss=total_loss,
