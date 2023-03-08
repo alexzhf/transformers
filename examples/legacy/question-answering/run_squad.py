@@ -277,6 +277,7 @@ def wrap_model(model, args):
     dumpy_tensor = torch.ones((args.eval_batch_size, 384), dtype=torch.long) \
                     if not args.use_multi_stream_module \
                     else torch.ones((args.eval_batch_size//args.num_streams, 384), dtype=torch.long)
+    dumpy_tensor = dumpy_tensor.to(args.device)
     jit_inputs = (dumpy_tensor, dumpy_tensor, dumpy_tensor)
     print(args)
 
@@ -319,6 +320,10 @@ def benchmark_evaluate(args, model, eval_dataloader):
     with tqdm(total=total_steps, desc="Evaluating") as pbar:
         for epoch in range(test_epoches + 1):
             for it, batch in enumerate(eval_dataloader):
+                # it might impact perf here. to be updated later.
+                batch[0] = batch[0].to(args.device)
+                batch[1] = batch[1].to(args.device)
+                batch[2] = batch[2].to(args.device)
                 if epoch * steps_per_epoch + it >= total_steps:
                     throughput = args.eval_batch_size * args.perf_run_iters / total_time
                     timeBuff = np.asarray(timeBuff)
